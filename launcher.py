@@ -7,12 +7,21 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 import unicodedata
 
 HOME = os.path.expanduser("~")
 TITLE = "Contas Claude"
-LOGIN_WARNING = ("Feche as outras janelas do Claude antes de logar, ou use login por e-mail, "
-                 "senão o link do navegador pode cair na conta errada.")
+LOGIN_WARNING = ("Deixe o Contas Claude aberto até terminar o login: enquanto isso, o retorno do navegador "
+                 "vai só para esta janela nova, sem mexer nas contas que já estão abertas.")
+LINK_TYPE = "x-scheme-handler/claude"
+LOGIN_HANDLER = "contas-claude-login.desktop"
+APP_HANDLER = "com.anthropic.Claude.desktop"
+# Setup que vai para um perfil novo. Login (Cookies, config.json, Local Storage, tokens de SSH) nunca é copiado;
+# as pastas temporárias das sessões ficam onde estão, porque as sessões guardam o caminho completo delas.
+ACCOUNT_DIRS = ("claude-code-sessions", "local-agent-mode-sessions")
+SHARED_SETUP = ("claude_desktop_config.json", "git-worktrees.json", "git-shadow", "ssh_configs.json",
+                "claude-ssh-remote", os.path.join("local-agent-mode-sessions", "skills-plugin"))
 
 
 def names_file(home=HOME):
@@ -26,6 +35,20 @@ def read_json(path):
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def saved_profiles(home=HOME):
+    """accounts.json: {pasta do perfil: {"name": nome escolhido, "account": id da conta}}."""
+    return {k: v if isinstance(v, dict) else {"name": v} for k, v in read_json(names_file(home)).items()}
+
+
+def save_profile(base, name, account=None, home=HOME):
+    path = names_file(home)
+    data = read_json(path)
+    data[base] = {"name": name, "account": account} if account else {"name": name}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def find_desktop_exe(home=HOME):
@@ -59,17 +82,23 @@ def code_accounts(home=HOME):
     return result
 
 
+def logged_account(profile_dir):
+    """Id da conta que já logou neste perfil do Desktop, ou None."""
+    return read_json(os.path.join(profile_dir, "config.json")).get("lastKnownAccountUuid")
+
+
 def desktop_profiles(home=HOME):
     config = os.path.join(home, ".config")
+    meta = saved_profiles(home)
     dirs = [os.path.join(config, "Claude")] + sorted(glob.glob(os.path.join(config, "Claude-*")))
-    return [{"dir": d, "uuid": read_json(os.path.join(d, "config.json")).get("lastKnownAccountUuid")}
+    return [{"dir": d, "uuid": logged_account(d) or meta.get(os.path.basename(d), {}).get("account")}
             for d in dirs if os.path.isdir(d)]
 
 
 def detect_accounts(home=HOME):
     """Junta perfis do Desktop e pastas do Code da mesma conta: pelo id da conta, senão pelo sufixo
-    (~/.config/Claude-x com ~/.claude-x). Devolve linhas {label, email, desktop, code}."""
-    names = read_json(names_file(home))
+    (~/.config/Claude-x com ~/.claude-x). Devolve linhas {label, email, account, desktop, code}."""
+    meta = saved_profiles(home)
     code = code_accounts(home)
     profiles = desktop_profiles(home)
     pair = {p["dir"]: next((c for c in code if c["uuid"] and c["uuid"] == p["uuid"]), None) for p in profiles}
@@ -87,18 +116,51 @@ def detect_accounts(home=HOME):
             elif not os.path.exists(twin):
                 c = {"dir": twin, "email": None}  # Code cria a pasta e pede login na primeira vez
         email = c and c["email"]
-        rows.append({"label": names.get(base) or email or base, "email": email,
-                     "desktop": p["dir"], "code": c and c["dir"]})
+        rows.append({"label": meta.get(base, {}).get("name") or email or base, "email": email,
+                     "account": p["uuid"], "desktop": p["dir"], "code": c and c["dir"]})
     for c in code:
         if c["dir"] not in used:
             rows.append({"label": c["email"] or os.path.basename(c["dir"]), "email": c["email"],
-                         "desktop": None, "code": c["dir"]})
+                         "account": c["uuid"], "desktop": None, "code": c["dir"]})
     return rows
+
+
+def copy_setup(account, dest, home=HOME):
+    """Copia para dest o setup desta conta guardado em outro perfil do Desktop (sessões, pastas, preferências).
+    Só copia o que ainda não existe em dest; a origem não é alterada. Devolve a pasta de origem ou None."""
+    for p in desktop_profiles(home):
+        src = p["dir"]
+        if src == dest or not any(os.path.isdir(os.path.join(src, d, account)) for d in ACCOUNT_DIRS):
+            continue
+        for rel in [os.path.join(d, account) for d in ACCOUNT_DIRS] + list(SHARED_SETUP):
+            s, t = os.path.join(src, rel), os.path.join(dest, rel)
+            if os.path.lexists(t) or not os.path.exists(s):
+                continue
+            os.makedirs(os.path.dirname(t), exist_ok=True)
+            if os.path.isdir(s):
+                shutil.copytree(s, t, symlinks=True)
+            else:
+                shutil.copy2(s, t)
+        return src
+    return None
 
 
 def slugify(name):
     ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", ascii_name).strip("-.")
+
+
+def create_profile(name, account=None, home=HOME):
+    """Cria ~/.config/Claude-<nome> (e copia o setup da conta, se já existir em outro perfil). Devolve a pasta."""
+    slug = slugify(name)
+    if not slug:
+        raise ValueError("Use letras ou números no nome.")
+    profile = os.path.join(home, ".config", "Claude-" + slug)
+    os.makedirs(profile, mode=0o700, exist_ok=True)
+    if account:
+        copy_setup(account, profile, home)
+    save_profile(os.path.basename(profile), name.strip(), account, home)
+    return profile
 
 
 def is_running(profile_dir):
@@ -114,6 +176,38 @@ def is_running(profile_dir):
 def launch(cmd):
     subprocess.Popen(cmd, start_new_session=True, cwd=HOME, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def link_handler():
+    """Atalho padrão dos links claude://. Usa o gio quando existe: é ele que abre links no GNOME,
+    e o 'xdg-mime query' pode responder pelo cache antigo."""
+    cmd = ["gio", "mime", LINK_TYPE] if shutil.which("gio") else ["xdg-mime", "query", "default", LINK_TYPE]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5,
+                             env={**os.environ, "LC_ALL": "C"}).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    first = out.splitlines()[0] if out else ""
+    return first.rsplit(": ", 1)[-1] if first.endswith(".desktop") else ""
+
+
+def set_link_handler(name):
+    cmd = ["gio", "mime", LINK_TYPE, name] if shutil.which("gio") else ["xdg-mime", "default", name, LINK_TYPE]
+    try:
+        subprocess.run(cmd, timeout=5, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def write_login_handler(exe, profile_dir, home=HOME):
+    """Atalho invisível que entrega links claude:// ao perfil que está logando."""
+    apps = os.path.join(home, ".local", "share", "applications")
+    os.makedirs(apps, exist_ok=True)
+    # shortcut: aspas sem escape; o perfil vem do slugify, só quebra se HOME tiver aspas ou $. Escapar se aparecer.
+    cmd = " ".join(f'"{a}"' for a in exe + ["--user-data-dir=" + profile_dir])
+    with open(os.path.join(apps, LOGIN_HANDLER), "w", encoding="utf-8") as f:
+        f.write("[Desktop Entry]\nType=Application\nName=Contas Claude (login)\nNoDisplay=true\n"
+                f"Exec={cmd} %u\nMimeType={LINK_TYPE};\n")
 
 
 def terminal_command(code_dir, home=HOME):
@@ -147,8 +241,12 @@ class App:
     def __init__(self, root):
         self.root = root
         self.exe = find_desktop_exe()
+        self.routing = None
+        if link_handler() == LOGIN_HANDLER:  # sobrou de uma execução que caiu no meio de um login
+            set_link_handler(APP_HANDLER)
         root.title(TITLE)
         root.minsize(480, 0)
+        root.protocol("WM_DELETE_WINDOW", self.close)
         style = ttk.Style(root)
         if "clam" in style.theme_names():
             style.theme_use("clam")
@@ -159,6 +257,10 @@ class App:
         self.body.pack(fill="both", expand=True)
         self.render()
 
+    def close(self):
+        self.stop_routing()
+        self.root.destroy()
+
     def render(self):
         for child in self.body.winfo_children():
             child.destroy()
@@ -166,6 +268,10 @@ class App:
             ttk.Label(self.body, style="Warn.TLabel", wraplength=440, text=(
                 "Claude Desktop não encontrado. Procurei claude-desktop no PATH, em /opt e AppImage "
                 "em ~/Applications. Instale o Claude Desktop para usar os botões Desktop.")
+            ).pack(fill="x", pady=(0, 12))
+        if self.routing:
+            ttk.Label(self.body, style="Warn.TLabel", wraplength=440, text=(
+                "Login em andamento: o retorno do navegador vai para " + short(self.routing["profile"]) + ".")
             ).pack(fill="x", pady=(0, 12))
         rows = detect_accounts()
         if not rows:
@@ -195,7 +301,7 @@ class App:
                        state="normal" if self.exe else "disabled").pack(side="left", padx=(8, 0))
         else:
             suggestion = (row["email"] or "").split("@")[0]
-            ttk.Button(box, text="Criar Desktop", command=lambda: self.add_account(suggestion),
+            ttk.Button(box, text="Criar Desktop", command=lambda: self.add_account(suggestion, row["account"]),
                        state="normal" if self.exe else "disabled").pack(side="left", padx=(8, 0))
         ttk.Button(box, text="Code", command=lambda: self.open_code(row["code"]),
                    state="normal" if row["code"] else "disabled").pack(side="left", padx=(8, 0))
@@ -204,7 +310,43 @@ class App:
         if is_running(profile_dir):
             messagebox.showinfo(TITLE, "O Claude Desktop desta conta já está aberto.", parent=self.root)
             return
+        first_login = not logged_account(profile_dir)
+        if first_login:
+            messagebox.showinfo(TITLE, LOGIN_WARNING, parent=self.root)
         launch(self.exe + ["--user-data-dir=" + profile_dir])
+        if first_login:
+            self.route_login(profile_dir)
+
+    def route_login(self, profile_dir):
+        """Até o login terminar, manda o retorno do navegador (links claude://) só para este perfil."""
+        if not (shutil.which("gio") or shutil.which("xdg-mime")):
+            return
+        self.stop_routing()
+        write_login_handler(self.exe, profile_dir)
+        current = link_handler()
+        self.routing = {"profile": profile_dir, "seen": False, "until": time.time() + 15 * 60,
+                        "previous": current if current and current != LOGIN_HANDLER else APP_HANDLER}
+        self.render()
+        self.keep_routing()
+
+    def keep_routing(self):
+        r = self.routing
+        if not r:
+            return
+        running = is_running(r["profile"])
+        r["seen"] = r["seen"] or running
+        if logged_account(r["profile"]) or time.time() > r["until"] or (r["seen"] and not running):
+            self.stop_routing()
+            self.render()
+            return
+        if link_handler() != LOGIN_HANDLER:
+            set_link_handler(LOGIN_HANDLER)  # o Claude Desktop se registra de novo como padrão ao abrir
+        self.root.after(2000, self.keep_routing)
+
+    def stop_routing(self):
+        if self.routing:
+            set_link_handler(self.routing["previous"])
+            self.routing = None
 
     def open_code(self, code_dir):
         cmd = terminal_command(code_dir)
@@ -214,24 +356,16 @@ class App:
             return
         launch(cmd)
 
-    def add_account(self, suggestion=""):
+    def add_account(self, suggestion="", account=None):
         name = simpledialog.askstring(TITLE, "Nome da nova conta:", initialvalue=suggestion, parent=self.root)
         if not name or not name.strip():
             return
-        slug = slugify(name)
-        if not slug:
-            messagebox.showerror(TITLE, "Use letras ou números no nome.", parent=self.root)
+        try:
+            profile = create_profile(name, account)
+        except ValueError as e:
+            messagebox.showerror(TITLE, str(e), parent=self.root)
             return
-        profile = os.path.join(HOME, ".config", "Claude-" + slug)
-        os.makedirs(profile, mode=0o700, exist_ok=True)
-        path = names_file()
-        names = read_json(path)
-        names[os.path.basename(profile)] = name.strip()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(names, f, ensure_ascii=False, indent=2)
         self.render()
-        messagebox.showwarning(TITLE, LOGIN_WARNING, parent=self.root)
         self.open_desktop(profile)
 
 
