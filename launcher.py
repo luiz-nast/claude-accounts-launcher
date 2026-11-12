@@ -12,20 +12,31 @@ import unicodedata
 
 HOME = os.path.expanduser("~")
 TITLE = "Contas Claude"
-LOGIN_WARNING = ("Deixe o Contas Claude aberto até terminar o login: enquanto isso, o retorno do navegador "
-                 "vai só para esta janela nova, sem mexer nas contas que já estão abertas.")
+LOGIN_WARNING = ("Entre só com \"Continuar com Google\" e escolha a conta certa no navegador. "
+                 "Não use login por e-mail: esse link pode cair na janela de outra conta e trocar a conta dela.\n\n"
+                 "Deixe o Contas Claude aberto até terminar o login. Enquanto isso, o retorno do navegador "
+                 "vai só para esta janela nova.")
+WRONG_ACCOUNT = ("A janela nova entrou numa conta diferente da esperada. Saia da conta nela "
+                 "e entre de novo com a conta certa.")
 LINK_TYPE = "x-scheme-handler/claude"
 LOGIN_HANDLER = "contas-claude-login.desktop"
+LOGIN_ID = LOGIN_HANDLER[:-len(".desktop")]
 APP_HANDLER = "com.anthropic.Claude.desktop"
-# Setup que vai para um perfil novo. Login (Cookies, config.json, Local Storage, tokens de SSH) nunca é copiado;
-# as pastas temporárias das sessões ficam onde estão, porque as sessões guardam o caminho completo delas.
+# Setup que vai para um perfil novo: só as sessões da própria conta. Login (Cookies, config.json, Local Storage,
+# tokens) nunca é copiado. git-worktrees.json e git-shadow também não: o Desktop do perfil novo trataria as
+# worktrees do outro perfil como órfãs e poderia removê-las. As pastas temporárias das sessões ficam onde estão.
 ACCOUNT_DIRS = ("claude-code-sessions", "local-agent-mode-sessions")
-SHARED_SETUP = ("claude_desktop_config.json", "git-worktrees.json", "git-shadow", "ssh_configs.json",
-                "claude-ssh-remote", os.path.join("local-agent-mode-sessions", "skills-plugin"))
+SHARED_SETUP = (os.path.join("local-agent-mode-sessions", "skills-plugin"),)
+PORTAL = ["busctl", "--user", "--json=short", "call", "org.freedesktop.impl.portal.PermissionStore",
+          "/org/freedesktop/impl/portal/PermissionStore", "org.freedesktop.impl.portal.PermissionStore"]
 
 
 def names_file(home=HOME):
     return os.path.join(home, ".config", "claude-accounts", "accounts.json")
+
+
+def routing_file(home=HOME):
+    return os.path.join(home, ".config", "claude-accounts", "routing.json")
 
 
 def read_json(path):
@@ -42,13 +53,16 @@ def saved_profiles(home=HOME):
     return {k: v if isinstance(v, dict) else {"name": v} for k, v in read_json(names_file(home)).items()}
 
 
-def save_profile(base, name, account=None, home=HOME):
-    path = names_file(home)
-    data = read_json(path)
-    data[base] = {"name": name, "account": account} if account else {"name": name}
+def write_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def save_profile(base, name, account=None, home=HOME):
+    data = read_json(names_file(home))
+    data[base] = {"name": name, "account": account} if account else {"name": name}
+    write_json(names_file(home), data)
 
 
 def find_desktop_exe(home=HOME):
@@ -77,7 +91,8 @@ def code_accounts(home=HOME):
             continue
         # Sem CLAUDE_CONFIG_DIR, a conta da pasta padrão fica em ~/.claude.json, fora dela.
         cfg = os.path.join(home, ".claude.json") if d == default else os.path.join(d, ".claude.json")
-        acc = read_json(cfg).get("oauthAccount") or {}
+        acc = read_json(cfg).get("oauthAccount")
+        acc = acc if isinstance(acc, dict) else {}
         result.append({"dir": d, "email": acc.get("emailAddress"), "uuid": acc.get("accountUuid")})
     return result
 
@@ -174,40 +189,94 @@ def is_running(profile_dir):
 
 
 def launch(cmd):
-    subprocess.Popen(cmd, start_new_session=True, cwd=HOME, stdin=subprocess.DEVNULL,
+    # Aberto de dentro de uma sessão do Claude, o launcher herdaria a conta dela: não repassa essas variáveis.
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "ANTHROPIC"))}
+    subprocess.Popen(cmd, start_new_session=True, cwd=HOME, env=env, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def run(cmd):
+    """Saída do comando, ou "" se ele não existir ou falhar."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=5,
+                              env={**os.environ, "LC_ALL": "C"}).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def link_handler():
     """Atalho padrão dos links claude://. Usa o gio quando existe: é ele que abre links no GNOME,
     e o 'xdg-mime query' pode responder pelo cache antigo."""
-    cmd = ["gio", "mime", LINK_TYPE] if shutil.which("gio") else ["xdg-mime", "query", "default", LINK_TYPE]
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5,
-                             env={**os.environ, "LC_ALL": "C"}).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return ""
+    out = run(["gio", "mime", LINK_TYPE] if shutil.which("gio") else ["xdg-mime", "query", "default", LINK_TYPE])
     first = out.splitlines()[0] if out else ""
     return first.rsplit(": ", 1)[-1] if first.endswith(".desktop") else ""
 
 
 def set_link_handler(name):
-    cmd = ["gio", "mime", LINK_TYPE, name] if shutil.which("gio") else ["xdg-mime", "default", name, LINK_TYPE]
+    run(["gio", "mime", LINK_TYPE, name] if shutil.which("gio") else ["xdg-mime", "default", name, LINK_TYPE])
+
+
+def portal_choices():
+    """Navegadores em snap/flatpak (ex.: o Firefox do Ubuntu) não seguem o padrão acima: o portal do sistema
+    abre o app que foi escolhido da última vez. Devolve {navegador: [app, vezes, limite]}."""
     try:
-        subprocess.run(cmd, timeout=5, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
-        pass
+        data = json.loads(run(PORTAL + ["Lookup", "ss", "desktop-used-apps", LINK_TYPE]))["data"][0]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def set_portal_choice(browser, choice):
+    if choice:
+        run(PORTAL + ["SetPermission", "sbssas", "desktop-used-apps", "true", LINK_TYPE, browser,
+                      str(len(choice))] + choice)
+    else:
+        run(PORTAL + ["DeletePermission", "sss", "desktop-used-apps", LINK_TYPE, browser])
+
+
+def apps_dir(home=HOME):
+    return os.path.join(home, ".local", "share", "applications")
 
 
 def write_login_handler(exe, profile_dir, home=HOME):
-    """Atalho invisível que entrega links claude:// ao perfil que está logando."""
-    apps = os.path.join(home, ".local", "share", "applications")
-    os.makedirs(apps, exist_ok=True)
+    """Atalho que entrega links claude:// ao perfil que está logando. Existe só enquanto o login roteia."""
+    os.makedirs(apps_dir(home), exist_ok=True)
     # shortcut: aspas sem escape; o perfil vem do slugify, só quebra se HOME tiver aspas ou $. Escapar se aparecer.
     cmd = " ".join(f'"{a}"' for a in exe + ["--user-data-dir=" + profile_dir])
-    with open(os.path.join(apps, LOGIN_HANDLER), "w", encoding="utf-8") as f:
-        f.write("[Desktop Entry]\nType=Application\nName=Contas Claude (login)\nNoDisplay=true\n"
+    with open(os.path.join(apps_dir(home), LOGIN_HANDLER), "w", encoding="utf-8") as f:
+        f.write("[Desktop Entry]\nType=Application\nName=Contas Claude (login)\n"
                 f"Exec={cmd} %u\nMimeType={LINK_TYPE};\n")
+
+
+def take_links(exe, profile_dir, home=HOME):
+    """Manda os links claude:// só para profile_dir. O estado anterior vai para o disco antes de qualquer
+    mudança, para restore_links desfazer mesmo se o launcher cair no meio."""
+    state = read_json(routing_file(home))
+    if not state:  # se já existe, é o original de um roteamento que não terminou: mantém
+        current = link_handler()
+        state = {"mime": current if current and current != LOGIN_HANDLER else APP_HANDLER,
+                 "portal": {b: (None if c and c[0] == LOGIN_ID else c) for b, c in portal_choices().items()}}
+        write_json(routing_file(home), state)
+    write_login_handler(exe, profile_dir, home)
+    set_link_handler(LOGIN_HANDLER)
+    for browser in state["portal"]:
+        set_portal_choice(browser, [LOGIN_ID, "3", "3"])  # vezes = limite: o portal abre direto, sem perguntar
+
+
+def restore_links(home=HOME):
+    """Devolve os links claude:// para quem tinha antes e apaga o atalho de login."""
+    state = read_json(routing_file(home))
+    if state:
+        set_link_handler(state.get("mime") or APP_HANDLER)
+        for browser, choice in (state.get("portal") or {}).items():
+            set_portal_choice(browser, choice)
+    elif link_handler() == LOGIN_HANDLER:
+        set_link_handler(APP_HANDLER)
+    for path in (os.path.join(apps_dir(home), LOGIN_HANDLER), routing_file(home)):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
 
 
 def terminal_command(code_dir, home=HOME):
@@ -242,8 +311,7 @@ class App:
         self.root = root
         self.exe = find_desktop_exe()
         self.routing = None
-        if link_handler() == LOGIN_HANDLER:  # sobrou de uma execução que caiu no meio de um login
-            set_link_handler(APP_HANDLER)
+        restore_links()  # sobra de uma execução que caiu no meio de um login
         root.title(TITLE)
         root.minsize(480, 0)
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -307,25 +375,26 @@ class App:
                    state="normal" if row["code"] else "disabled").pack(side="left", padx=(8, 0))
 
     def open_desktop(self, profile_dir):
-        if is_running(profile_dir):
-            messagebox.showinfo(TITLE, "O Claude Desktop desta conta já está aberto.", parent=self.root)
-            return
         first_login = not logged_account(profile_dir)
+        if is_running(profile_dir):
+            if first_login:  # login ficou pela metade: volta a mandar o retorno do navegador para ela
+                messagebox.showinfo(TITLE, LOGIN_WARNING, parent=self.root)
+                self.route_login(profile_dir)
+            else:
+                messagebox.showinfo(TITLE, "O Claude Desktop desta conta já está aberto.", parent=self.root)
+            return
         if first_login:
             messagebox.showinfo(TITLE, LOGIN_WARNING, parent=self.root)
+            self.route_login(profile_dir)  # antes de abrir: o retorno não pode cair em outra janela
         launch(self.exe + ["--user-data-dir=" + profile_dir])
-        if first_login:
-            self.route_login(profile_dir)
 
     def route_login(self, profile_dir):
         """Até o login terminar, manda o retorno do navegador (links claude://) só para este perfil."""
         if not (shutil.which("gio") or shutil.which("xdg-mime")):
             return
         self.stop_routing()
-        write_login_handler(self.exe, profile_dir)
-        current = link_handler()
-        self.routing = {"profile": profile_dir, "seen": False, "until": time.time() + 15 * 60,
-                        "previous": current if current and current != LOGIN_HANDLER else APP_HANDLER}
+        take_links(self.exe, profile_dir)
+        self.routing = {"profile": profile_dir, "seen": False, "until": time.time() + 15 * 60}
         self.render()
         self.keep_routing()
 
@@ -335,9 +404,13 @@ class App:
             return
         running = is_running(r["profile"])
         r["seen"] = r["seen"] or running
-        if logged_account(r["profile"]) or time.time() > r["until"] or (r["seen"] and not running):
+        got = logged_account(r["profile"])
+        if got or time.time() > r["until"] or (r["seen"] and not running):
             self.stop_routing()
             self.render()
+            want = saved_profiles().get(os.path.basename(r["profile"]), {}).get("account")
+            if got and want and got != want:
+                messagebox.showwarning(TITLE, WRONG_ACCOUNT, parent=self.root)
             return
         if link_handler() != LOGIN_HANDLER:
             set_link_handler(LOGIN_HANDLER)  # o Claude Desktop se registra de novo como padrão ao abrir
@@ -345,7 +418,7 @@ class App:
 
     def stop_routing(self):
         if self.routing:
-            set_link_handler(self.routing["previous"])
+            restore_links()
             self.routing = None
 
     def open_code(self, code_dir):
