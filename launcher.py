@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -388,6 +389,7 @@ def take_links(exe, profile_dir, home=HOME):
     hidden += [a for a in link_apps() if a != LOGIN_HANDLER and a not in hidden]
     takeover = {"groups": None, "Default Applications": LOGIN_HANDLER, "Added Associations": LOGIN_HANDLER + ";",
                 "Removed Associations": ";".join(hidden) + ";"}
+    os.sync()  # o estado e o autostart chegam ao disco antes da troca: numa queda de energia, dá para desfazer
     set_mime_entries(takeover, home)
     for browser in state["portal"]:
         set_portal_choice(browser, [LOGIN_ID, "3", "3"])  # onde o portal lembra a escolha, ela passa a ser a nossa
@@ -592,10 +594,20 @@ if __name__ == "__main__":
     # O Tk muda a caixa do className; fixar argv0 deixa WM_CLASS igual ao StartupWMClass do .desktop.
     root = tk.Tk(className=TITLE, useTk=False)
     root.tk.setvar("argv0", TITLE)
+    for _ in range(6):  # o --restore do autostart pode estar terminando
+        if lock:
+            break
+        time.sleep(0.5)
+        lock = take_lock()
     root.loadtk()
     if not lock:
         root.withdraw()
-        messagebox.showinfo(TITLE, "O Contas Claude já está aberto.")
+        messagebox.showinfo(TITLE, "O Contas Claude já está aberto em outra janela.")
         raise SystemExit
-    App(root)
+    app = App(root)
+    # kill comum e fim da sessão também desfazem o roteamento. O Python só trata o sinal quando volta a rodar,
+    # e o keep_routing roda a cada 2 s durante um login. shortcut: SIGKILL não tem como; aí o autostart
+    # ou a próxima abertura do launcher desfazem.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: root.after(0, app.close))
     root.mainloop()

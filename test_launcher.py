@@ -1,4 +1,7 @@
 import os
+import runpy
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -252,6 +255,30 @@ class KeepRouting(FakeSystem):
             self.assertIsNone(app.routing)
             self.assertEqual(self.mimeapps(home), MIMEAPPS)
             box.showwarning.assert_called_once()
+
+
+class Main(FakeSystem):
+    """O __main__ de verdade no modo --restore (o do autostart), com HOME falso e sem gio/busctl reais."""
+
+    def run_restore(self, home):
+        done = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.dict(os.environ, {"HOME": home}), mock.patch.object(sys, "argv", ["launcher.py", "--restore"]), \
+                mock.patch.object(subprocess, "run", return_value=done), self.assertRaises(SystemExit):
+            runpy.run_path(launcher.__file__, run_name="__main__")
+
+    def test_restore_waits_for_a_running_launcher_then_restores(self):
+        with tempfile.TemporaryDirectory() as home:
+            self.mimeapps(home, MIMEAPPS)
+            launcher.take_links(["/usr/bin/claude-desktop"], "/p/Claude-x", home)
+
+            running = launcher.take_lock(home)
+            self.run_restore(home)
+            self.assertEqual(launcher.mime_entries(home)["Default Applications"], launcher.LOGIN_HANDLER)
+            running.close()
+
+            self.run_restore(home)
+            self.assertEqual(self.mimeapps(home), MIMEAPPS)
+            self.assertFalse(os.path.exists(launcher.restore_entry(home)))
 
 
 class Lock(unittest.TestCase):
