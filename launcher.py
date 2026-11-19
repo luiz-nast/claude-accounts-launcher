@@ -78,9 +78,9 @@ def write_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def save_profile(base, name, account=None, home=HOME):
+def save_profile(base, name, account=None, home=HOME, code=None):
     data = read_json(names_file(home))
-    data[base] = {"name": name, "account": account} if account else {"name": name}
+    data[base] = {k: v for k, v in (("name", name), ("account", account), ("code", code)) if v}
     write_json(names_file(home), data)
 
 
@@ -130,18 +130,31 @@ def desktop_profiles(home=HOME):
 
 
 def detect_accounts(home=HOME):
-    """Junta perfis do Desktop e pastas do Code da mesma conta: pelo id da conta, senão pelo sufixo
-    (~/.config/Claude-x com ~/.claude-x). Devolve linhas {label, email, account, desktop, code}."""
+    """Junta perfis do Desktop e pastas do Code da mesma conta: pela pasta salva no accounts.json, senão pelo id
+    da conta, senão pelo sufixo (~/.config/Claude-x com ~/.claude-x). A pasta salva vem antes porque o id sai do
+    .claude.json, que pode citar outra conta que não a do token (já aconteceu: outra instância regravou o campo).
+    Devolve linhas {label, email, account, desktop, code}."""
     meta = saved_profiles(home)
     code = code_accounts(home)
+    by_dir = {c["dir"]: c for c in code}
     profiles = desktop_profiles(home)
-    pair = {p["dir"]: next((c for c in code if c["uuid"] and c["uuid"] == p["uuid"]), None) for p in profiles}
-    used = {c["dir"] for c in pair.values() if c}
+    pair = {}
+    for p in profiles:
+        saved = meta.get(os.path.basename(p["dir"]), {}).get("code")
+        if saved:
+            pair[p["dir"]] = by_dir.get(saved) or {"dir": saved, "email": None, "uuid": None}
+    used = {c["dir"] for c in pair.values()}
+    for p in profiles:
+        c = None if p["dir"] in pair else next(
+            (c for c in code if c["uuid"] and c["uuid"] == p["uuid"] and c["dir"] not in used), None)
+        if c:
+            pair[p["dir"]] = c
+            used.add(c["dir"])
     rows = []
     for p in profiles:
         base = os.path.basename(p["dir"])
         twin = os.path.join(home, ".claude-" + base[len("Claude-"):]) if base != "Claude" else None
-        c = pair[p["dir"]]
+        c = pair.get(p["dir"])
         if c is None and twin:
             c = next((x for x in code if x["dir"] == twin and x["dir"] not in used
                       and not (x["uuid"] and p["uuid"])), None)
@@ -149,7 +162,8 @@ def detect_accounts(home=HOME):
                 used.add(c["dir"])
             elif not os.path.exists(twin):
                 c = {"dir": twin, "email": None}  # Code cria a pasta e pede login na primeira vez
-        email = c and c["email"]
+        # o e-mail do Code só vale para a linha se ele é da mesma conta do Desktop
+        email = c["email"] if c and (not p["uuid"] or c.get("uuid") == p["uuid"]) else None
         rows.append({"label": meta.get(base, {}).get("name") or email or base, "email": email,
                      "account": p["uuid"], "desktop": p["dir"], "code": c and c["dir"]})
     for c in code:
@@ -184,7 +198,7 @@ def slugify(name):
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", ascii_name).strip("-.")
 
 
-def create_profile(name, account=None, home=HOME):
+def create_profile(name, account=None, home=HOME, code=None):
     """Cria ~/.config/Claude-<nome> (e copia o setup da conta, se já existir em outro perfil). Devolve a pasta."""
     slug = slugify(name)
     if not slug:
@@ -193,7 +207,7 @@ def create_profile(name, account=None, home=HOME):
     os.makedirs(profile, mode=0o700, exist_ok=True)
     if account:
         copy_setup(account, profile, home)
-    save_profile(os.path.basename(profile), name.strip(), account, home)
+    save_profile(os.path.basename(profile), name.strip(), account, home, code)
     return profile
 
 
@@ -509,7 +523,7 @@ class App:
                        state="normal" if self.exe else "disabled").pack(side="left", padx=(8, 0))
         else:
             suggestion = (row["email"] or "").split("@")[0]
-            ttk.Button(box, text="Criar Desktop", command=lambda: self.add_account(suggestion, row["account"]),
+            ttk.Button(box, text="Criar Desktop", command=lambda: self.add_account(suggestion, row["account"], row["code"]),
                        state="normal" if self.exe else "disabled").pack(side="left", padx=(8, 0))
         ttk.Button(box, text="Code", command=lambda: self.open_code(row["code"]),
                    state="normal" if row["code"] else "disabled").pack(side="left", padx=(8, 0))
@@ -567,12 +581,12 @@ class App:
             return
         launch(cmd)
 
-    def add_account(self, suggestion="", account=None):
+    def add_account(self, suggestion="", account=None, code=None):
         name = simpledialog.askstring(TITLE, "Nome da nova conta:", initialvalue=suggestion, parent=self.root)
         if not name or not name.strip():
             return
         try:
-            profile = create_profile(name, account)
+            profile = create_profile(name, account, self.home, code)
         except ValueError as e:
             messagebox.showerror(TITLE, str(e), parent=self.root)
             return

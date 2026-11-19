@@ -37,6 +37,31 @@ class DetectAccounts(unittest.TestCase):
             self.assertEqual(rows["conta-a"]["code"], os.path.join(home, ".claude"))
             self.assertEqual(len(rows), 3)
 
+    def test_saved_code_folder_beats_a_lying_claude_json(self):
+        # o .claude.json da pasta padrão passou a citar a conta u2, mas o token lá é da u1 (caso real)
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, ".claude"))
+            write_json(os.path.join(home, ".claude.json"), {"oauthAccount": {"emailAddress": "b", "accountUuid": "u2"}})
+            write_json(os.path.join(home, ".claude-b", ".claude.json"),
+                       {"oauthAccount": {"emailAddress": "b", "accountUuid": "u2"}})
+            write_json(os.path.join(home, ".config", "Claude", "config.json"), {"lastKnownAccountUuid": "u1"})
+            write_json(os.path.join(home, ".config", "Claude-b", "config.json"), {"lastKnownAccountUuid": "u2"})
+            launcher.save_profile("Claude", "A", "u1", home, os.path.join(home, ".claude"))
+            launcher.save_profile("Claude-b", "B", "u2", home, os.path.join(home, ".claude-b"))
+
+            rows = {r["label"]: r for r in launcher.detect_accounts(home)}
+
+            self.assertEqual(set(rows), {"A", "B"})
+            self.assertEqual(rows["A"]["code"], os.path.join(home, ".claude"))
+            self.assertIsNone(rows["A"]["email"])  # o rótulo diz b, mas o Desktop é u1
+            self.assertEqual(rows["B"]["code"], os.path.join(home, ".claude-b"))
+
+    def test_new_profile_saves_its_code_folder(self):
+        with tempfile.TemporaryDirectory() as home:
+            profile = launcher.create_profile("B", "u2", home, os.path.join(home, ".claude-b"))
+            self.assertEqual(launcher.saved_profiles(home)[os.path.basename(profile)],
+                             {"name": "B", "account": "u2", "code": os.path.join(home, ".claude-b")})
+
     def test_new_profile_copies_setup_but_never_login(self):
         with tempfile.TemporaryDirectory() as home:
             os.makedirs(os.path.join(home, ".claude"))
