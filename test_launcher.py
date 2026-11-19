@@ -56,6 +56,57 @@ class DetectAccounts(unittest.TestCase):
             self.assertIsNone(rows["A"]["email"])  # o rótulo diz b, mas o Desktop é u1
             self.assertEqual(rows["B"]["code"], os.path.join(home, ".claude-b"))
 
+    def test_incident_without_saved_pairs(self):
+        # o caso real sem accounts.json: ~/.claude tem o token da u1 mas o rótulo da u2, que também é a de ~/.claude-b
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, ".claude"))
+            write_json(os.path.join(home, ".claude.json"), {"oauthAccount": {"emailAddress": "b", "accountUuid": "u2"}})
+            write_json(os.path.join(home, ".claude-b", ".claude.json"),
+                       {"oauthAccount": {"emailAddress": "b", "accountUuid": "u2"}})
+            write_json(os.path.join(home, ".config", "Claude", "config.json"), {"lastKnownAccountUuid": "u1"})
+            write_json(os.path.join(home, ".config", "Claude-b2", "config.json"), {"lastKnownAccountUuid": "u2"})
+
+            rows = sorted((r["desktop"] and os.path.basename(r["desktop"]), r["code"] and os.path.basename(r["code"]))
+                          for r in launcher.detect_accounts(home))
+
+            self.assertEqual(rows, [("Claude", ".claude"), ("Claude-b2", ".claude-b")])
+
+    def test_saved_folder_is_normalized_and_not_shared(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"HOME": home}):
+            for d in (".claude", ".claude-b"):
+                os.makedirs(os.path.join(home, d))
+            for base in ("Claude", "Claude-b"):
+                os.makedirs(os.path.join(home, ".config", base))
+            write_json(launcher.names_file(home), {"Claude": {"name": "A", "code": os.path.join(home, ".claude") + "/"},
+                                                   "Claude-b": {"name": "B", "code": "~/.claude"}})
+            rows = {r["label"]: r["code"] for r in launcher.detect_accounts(home)}
+            self.assertEqual(rows["A"], os.path.join(home, ".claude"))
+            self.assertNotEqual(rows["B"], os.path.join(home, ".claude"))
+
+    def test_existing_name_is_refused_and_keeps_the_pair(self):
+        with tempfile.TemporaryDirectory() as home:
+            launcher.create_profile("B", "u2", home, os.path.join(home, ".claude-b"))
+            before = launcher.saved_profiles(home)
+            with self.assertRaises(ValueError):
+                launcher.create_profile("B", None, home)
+            self.assertEqual(launcher.saved_profiles(home), before)
+
+    def test_add_account_pins_the_twin_code_folder(self):
+        with tempfile.TemporaryDirectory() as home:
+            launcher.create_profile("Nova", None, home)
+            self.assertEqual(launcher.saved_profiles(home)["Claude-Nova"]["code"], os.path.join(home, ".claude-Nova"))
+
+    def test_broken_accounts_file_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.dirname(launcher.names_file(home)))
+            with open(launcher.names_file(home), "w") as f:
+                f.write('{"Claude": {"name": "A",}}')
+            with self.assertRaises(ValueError):
+                launcher.create_profile("B", None, home)
+            with open(launcher.names_file(home)) as f:
+                self.assertEqual(f.read(), '{"Claude": {"name": "A",}}')
+            self.assertFalse(os.path.exists(os.path.join(home, ".config", "Claude-B")))
+
     def test_new_profile_saves_its_code_folder(self):
         with tempfile.TemporaryDirectory() as home:
             profile = launcher.create_profile("B", "u2", home, os.path.join(home, ".claude-b"))

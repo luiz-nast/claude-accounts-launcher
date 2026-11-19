@@ -78,8 +78,22 @@ def write_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def names_for_writing(home=HOME):
+    """accounts.json para regravar. Com erro, recusa: regravar perderia todos os pareamentos salvos."""
+    try:
+        with open(names_file(home), encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        data = None
+    if not isinstance(data, dict):
+        raise ValueError("O arquivo " + names_file(home) + " está com erro. Corrija ou apague antes de criar a conta.")
+    return data
+
+
 def save_profile(base, name, account=None, home=HOME, code=None):
-    data = read_json(names_file(home))
+    data = names_for_writing(home)
     data[base] = {k: v for k, v in (("name", name), ("account", account), ("code", code)) if v}
     write_json(names_file(home), data)
 
@@ -141,9 +155,14 @@ def detect_accounts(home=HOME):
     pair = {}
     for p in profiles:
         saved = meta.get(os.path.basename(p["dir"]), {}).get("code")
-        if saved:
+        saved = os.path.abspath(os.path.expanduser(saved)) if isinstance(saved, str) and saved else None
+        if saved and saved not in {c["dir"] for c in pair.values()}:
             pair[p["dir"]] = by_dir.get(saved) or {"dir": saved, "email": None, "uuid": None}
     used = {c["dir"] for c in pair.values()}
+    # ~/.claude.json citando a conta de outra pasta ou de um perfil já pareado: outra instância regravou o rótulo
+    taken = {c["uuid"] for c in code[1:]} | {p["uuid"] for p in profiles if p["dir"] in pair}
+    if code and code[0]["dir"] == os.path.join(home, ".claude") and code[0]["dir"] not in used and code[0]["uuid"] in taken:
+        code[0].update(email=None, uuid=None)
     for p in profiles:
         c = None if p["dir"] in pair else next(
             (c for c in code if c["uuid"] and c["uuid"] == p["uuid"] and c["dir"] not in used), None)
@@ -153,7 +172,7 @@ def detect_accounts(home=HOME):
     rows = []
     for p in profiles:
         base = os.path.basename(p["dir"])
-        twin = os.path.join(home, ".claude-" + base[len("Claude-"):]) if base != "Claude" else None
+        twin = os.path.join(home, ".claude" + base[len("Claude"):])  # Claude-x com .claude-x, Claude com .claude
         c = pair.get(p["dir"])
         if c is None and twin:
             c = next((x for x in code if x["dir"] == twin and x["dir"] not in used
@@ -204,9 +223,14 @@ def create_profile(name, account=None, home=HOME, code=None):
     if not slug:
         raise ValueError("Use letras ou números no nome.")
     profile = os.path.join(home, ".config", "Claude-" + slug)
-    os.makedirs(profile, mode=0o700, exist_ok=True)
+    names_for_writing(home)  # antes de criar a pasta: um accounts.json com erro não deixa perfil pela metade
+    if os.path.lexists(profile):  # save_profile trocaria a entrada inteira e perderia o account e o code dela
+        raise ValueError("Já existe a conta " + slug + ". Use o botão Desktop dela ou escolha outro nome.")
+    os.makedirs(profile, mode=0o700)
     if account:
         copy_setup(account, profile, home)
+    elif not code:  # Adicionar conta: fixa a pasta gêmea, o id do ~/.claude.json pode citar esta conta depois
+        code = os.path.join(home, ".claude-" + slug)
     save_profile(os.path.basename(profile), name.strip(), account, home, code)
     return profile
 
@@ -495,7 +519,7 @@ class App:
             ttk.Label(self.body, style="Warn.TLabel", wraplength=440, text=(
                 "Login em andamento: o retorno do navegador vai para " + short(self.routing["profile"]) + ".")
             ).pack(fill="x", pady=(0, 12))
-        rows = detect_accounts()
+        rows = detect_accounts(self.home)
         if not rows:
             ttk.Label(self.body, text="Nenhuma conta encontrada. Use \"Adicionar conta\".").pack(anchor="w")
         for row in rows:
